@@ -32,6 +32,13 @@ memory, data) ships as one self-contained JavaScript module.</p>
   with the mouse; per-frame draw times shown live.
 </a>
 
+<a class="card" href="radiance/">
+  <h2>Volume radiance</h2>
+  Unbiased path tracing of the same cloud (delta tracking with a voxel majorant, ratio-tracked shadow rays,
+  Henyey-Greenstein phase) lit by a single directional light, refined progressively. Light, density, anisotropy
+  and bounce controls; per-sample timings shown live.
+</a>
+
 <p id="webgpu" class="muted"></p>
 <script>
   document.getElementById('webgpu').textContent = navigator.gpu
