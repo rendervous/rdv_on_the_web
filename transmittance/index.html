@@ -1,0 +1,204 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>rdv · volume transmittance (WebGPU)</title>
+<link rel="icon" href="data:,">
+<style>
+  :root { color-scheme: dark; }
+  body { margin: 0; background: #16181d; color: #d6d9e0; font: 13px/1.4 system-ui, sans-serif;
+         display: flex; gap: 16px; padding: 16px; box-sizing: border-box; height: 100vh; }
+  #view { position: relative; flex: 1; display: flex; align-items: center; justify-content: center;
+          background: #0d0e11; border-radius: 6px; overflow: hidden; }
+  canvas { width: min(100%, calc(100vh - 32px)); aspect-ratio: 1; image-rendering: auto; cursor: grab; touch-action: none; }
+  canvas.dragging { cursor: grabbing; }
+  #stats { position: absolute; top: 10px; left: 10px; padding: 8px 10px; border-radius: 4px;
+           background: rgba(0, 0, 0, .6); font: 12px/1.5 ui-monospace, monospace; white-space: pre; pointer-events: none; }
+  aside { width: 260px; display: flex; flex-direction: column; gap: 14px; }
+  h1 { font-size: 15px; margin: 0; }
+  label { display: flex; flex-direction: column; gap: 4px; }
+  label span { display: flex; justify-content: space-between; color: #9aa0ab; }
+  input[type=range], select { width: 100%; }
+  .row { display: flex; gap: 8px; align-items: center; }
+  button { background: #2a2e37; color: inherit; border: 1px solid #3a3f4b; border-radius: 4px; padding: 5px 10px; cursor: pointer; }
+  .help { color: #8a909b; font-size: 12px; }
+  #error { color: #ff8a80; white-space: pre-wrap; }
+</style>
+</head>
+<body>
+<div id="view">
+  <canvas id="canvas" width="512" height="512"></canvas>
+  <div id="stats">loading…</div>
+</div>
+<aside>
+  <h1>Volume transmittance</h1>
+  <div class="help">Left drag: orbit · Right / Shift drag: pan · Scroll: zoom</div>
+  <label><span>Resolution</span>
+    <select id="resolution">
+      <option>256</option><option selected>512</option><option>768</option><option>1024</option>
+    </select>
+  </label>
+  <label><span>Density scale <b id="densityOut"></b></span>
+    <input id="density" type="range" min="0.5" max="20" step="0.1" value="4">
+  </label>
+  <label><span>Step size <b id="stepOut"></b></span>
+    <input id="step" type="range" min="0.002" max="0.05" step="0.001" value="0.01">
+  </label>
+  <label><span>Field of view <b id="fovOut"></b></span>
+    <input id="fov" type="range" min="15" max="90" step="1" value="45">
+  </label>
+  <div class="row">
+    <label class="row" style="flex-direction:row"><input id="continuous" type="checkbox"> continuous redraw</label>
+  </div>
+  <button id="reset">Reset camera</button>
+  <div id="error"></div>
+</aside>
+
+<script type="module">
+const $ = (id) => document.getElementById(id);
+const stats = $('stats');
+const canvas = $('canvas');
+const ctx = canvas.getContext('2d');
+
+// ---------------------------------------------------------------- camera
+// Orbit camera around `target`. rdv's own camera convention (see
+// shaders/rendering/cameras.h, reproduced by TransmittanceView) maps screen
+// right to cross(up, forward) and screen down to the camera's up axis, so
+// mouse motion is converted through those same two axes.
+const DEFAULT = { yaw: 0.6, pitch: 0.15, distance: 3.0, target: [0, 0, 0] };
+const cam = structuredClone(DEFAULT);
+const UP = [0, 1, 0];
+const add = (a, b, s = 1) => a.map((x, i) => x + b[i] * s);
+const sub = (a, b) => a.map((x, i) => x - b[i]);
+const cross = (a, b) => [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]];
+const normalize = (a) => { const l = Math.hypot(...a); return a.map((x) => x / l); };
+
+function origin() {
+  const { yaw, pitch, distance, target } = cam;
+  return add(target, [Math.sin(yaw) * Math.cos(pitch), Math.sin(pitch), Math.cos(yaw) * Math.cos(pitch)], distance);
+}
+function screenAxes() {
+  const forward = normalize(sub(cam.target, origin()));
+  const right = normalize(cross(UP, forward));
+  return { right, down: cross(forward, right) };
+}
+
+let dirty = true;
+let drag = null;
+canvas.addEventListener('contextmenu', (e) => e.preventDefault());
+canvas.addEventListener('pointerdown', (e) => {
+  drag = { x: e.clientX, y: e.clientY, pan: e.button !== 0 || e.shiftKey };
+  canvas.setPointerCapture(e.pointerId);
+  canvas.classList.add('dragging');
+});
+canvas.addEventListener('pointerup', (e) => {
+  drag = null;
+  canvas.releasePointerCapture(e.pointerId);
+  canvas.classList.remove('dragging');
+});
+canvas.addEventListener('pointermove', (e) => {
+  if (!drag) return;
+  const dx = e.clientX - drag.x, dy = e.clientY - drag.y;
+  drag.x = e.clientX; drag.y = e.clientY;
+  const pixels = canvas.clientHeight;
+  if (drag.pan) {
+    // grab-style: the point under the cursor follows it
+    const fov = $('fov').value * Math.PI / 180;
+    const worldPerPixel = 2 * cam.distance * Math.tan(fov / 2) / pixels;
+    const { right, down } = screenAxes();
+    cam.target = add(add(cam.target, right, -dx * worldPerPixel), down, -dy * worldPerPixel);
+  } else {
+    cam.yaw += dx / pixels * Math.PI;
+    cam.pitch = Math.max(-1.5, Math.min(1.5, cam.pitch - dy / pixels * Math.PI));
+  }
+  dirty = true;
+});
+canvas.addEventListener('wheel', (e) => {
+  e.preventDefault();
+  cam.distance = Math.max(0.2, Math.min(20, cam.distance * Math.exp(e.deltaY * 0.001)));
+  dirty = true;
+}, { passive: false });
+$('reset').onclick = () => { Object.assign(cam, structuredClone(DEFAULT)); dirty = true; };
+for (const id of ['density', 'step', 'fov', 'resolution']) $(id).oninput = () => { dirty = true; };
+
+// ---------------------------------------------------------------- timings
+const history = [];
+const avg = (key) => history.reduce((s, h) => s + h[key], 0) / Math.max(history.length, 1);
+let loadInfo = '';
+function showStats(last) {
+  history.push(last);
+  if (history.length > 30) history.shift();
+  const span = (history.at(-1).end - history[0].end) / 1000;
+  const fps = history.length > 1 ? (history.length - 1) / span : 0;
+  stats.textContent =
+    `${last.w}×${last.h} px\n` +
+    `evaluate (GPU+readback) ${last.evaluate.toFixed(2).padStart(7)} ms  avg ${avg('evaluate').toFixed(2)}\n` +
+    `canvas draw             ${last.draw.toFixed(2).padStart(7)} ms  avg ${avg('draw').toFixed(2)}\n` +
+    `frame total             ${last.total.toFixed(2).padStart(7)} ms  avg ${avg('total').toFixed(2)}\n` +
+    `redraws/s ${fps.toFixed(1)}\n` + loadInfo;
+}
+
+// ---------------------------------------------------------------- render
+let evaluator, image, pixels, imageData;
+function buffersFor(w, h) {
+  if (image && image.length === w * h) return;
+  canvas.width = w; canvas.height = h;
+  image = new Float32Array(w * h);
+  imageData = ctx.createImageData(w, h);
+  pixels = new Uint32Array(imageData.data.buffer);
+}
+
+async function render() {
+  const t0 = performance.now();
+  const w = Number($('resolution').value), h = w;
+  buffersFor(w, h);
+  const density = Number($('density').value), step = Number($('step').value), fovDeg = Number($('fov').value);
+  $('densityOut').textContent = density.toFixed(1);
+  $('stepOut').textContent = step.toFixed(3);
+  $('fovOut').textContent = `${fovDeg}°`;
+  await evaluator.evaluate({
+    image,
+    origin: origin(), target: cam.target, up: UP, fov: fovDeg * Math.PI / 180,
+    width: w, height: h,
+    'map.density_scale': density, 'map.step_size': step,
+  }, { threads: [w, h] });
+  const t1 = performance.now();
+  for (let i = 0; i < image.length; i++) {
+    const v = Math.max(0, Math.min(255, image[i] * 255)) | 0;
+    pixels[i] = 0xff000000 | (v << 16) | (v << 8) | v;
+  }
+  ctx.putImageData(imageData, 0, 0);
+  const t2 = performance.now();
+  showStats({ w, h, evaluate: t1 - t0, draw: t2 - t1, total: t2 - t0, end: t2 });
+}
+
+let busy = false;
+function tick() {
+  if ((dirty || $('continuous').checked) && !busy) {
+    dirty = false;
+    busy = true;
+    render().catch((e) => { $('error').textContent = String(e?.stack ?? e); })
+            .finally(() => { busy = false; });
+  }
+  requestAnimationFrame(tick);
+}
+
+// ---------------------------------------------------------------- startup
+try {
+  if (!navigator.gpu) throw new Error('This browser has no WebGPU (navigator.gpu is undefined).\n' +
+                                      'Use a recent Chrome/Edge, or Firefox/Safari with WebGPU enabled.');
+  const t0 = performance.now();
+  const mod = await import('./transmittance.js');
+  const t1 = performance.now();
+  evaluator = await mod.createEvaluator();
+  const t2 = performance.now();
+  loadInfo = `\nmodule load   ${(t1 - t0).toFixed(0)} ms\npipeline+heap ${(t2 - t1).toFixed(0)} ms`;
+  evaluator.device.lost.then((info) => { $('error').textContent = `GPU device lost: ${info.message}`; });
+  requestAnimationFrame(tick);
+} catch (e) {
+  stats.textContent = 'failed';
+  $('error').textContent = String(e?.stack ?? e);
+}
+</script>
+</body>
+</html>

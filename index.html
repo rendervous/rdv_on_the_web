@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>rdv on the web</title>
+<link rel="icon" href="data:,">
+<style>
+  :root { color-scheme: dark; }
+  body { margin: 0 auto; max-width: 720px; padding: 48px 24px; background: #16181d; color: #d6d9e0;
+         font: 15px/1.6 system-ui, sans-serif; }
+  h1 { font-size: 24px; margin: 0 0 8px; }
+  a { color: #8ab4f8; }
+  .card { display: block; margin-top: 24px; padding: 16px 20px; border: 1px solid #2f343e; border-radius: 8px;
+          background: #1c1f26; text-decoration: none; color: inherit; }
+  .card:hover { border-color: #8ab4f8; }
+  .card h2 { margin: 0 0 4px; font-size: 17px; color: #8ab4f8; }
+  .muted { color: #8a909b; font-size: 13px; }
+  #webgpu { margin-top: 24px; }
+</style>
+</head>
+<body>
+<h1>rdv on the web</h1>
+<p>Megakernels built with <a href="https://github.com/rendervous/rdv_project">rdv</a> (a differentiable, megakernel-based
+GPU engine on Vulkan), exported to <b>WebGPU</b>: the node graph's GLSL is compiled to SPIR-V, its buffer-reference
+pointers are lowered to offsets into a single storage buffer, Tint translates it to WGSL, and everything (shader, node
+memory, data) ships as one self-contained JavaScript module.</p>
+
+<a class="card" href="transmittance/">
+  <h2>Volume transmittance</h2>
+  Ray-marched transmittance through the Disney cloud (154×85×125 voxels, trilinear sampling). Orbit, pan and zoom
+  with the mouse; per-frame draw times shown live.
+</a>
+
+<p id="webgpu" class="muted"></p>
+<script>
+  document.getElementById('webgpu').textContent = navigator.gpu
+    ? 'WebGPU is available in this browser.'
+    : 'WebGPU is not available in this browser - use a recent Chrome/Edge, or Firefox/Safari with WebGPU enabled.';
+</script>
+</body>
+</html>
