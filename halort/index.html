@@ -302,9 +302,26 @@ function tick() {
 }
 
 // ---------------------------------------------------------------- startup
+// ONNX Runtime Web (its emdawnwebgpu layer) reads GPUDevice.adapterInfo -
+// copied from GPUAdapter.info on devices it creates itself - and fails on
+// browsers that don't implement those (fairly new) attributes yet. Any
+// adapter/device without them reports an empty info object instead.
+function shimAdapterInfo() {
+  const fallback = { vendor: '', architecture: '', device: '', description: '', subgroupMinSize: 4, subgroupMaxSize: 128 };
+  for (const [cls, name] of [[globalThis.GPUAdapter, 'info'], [globalThis.GPUDevice, 'adapterInfo']]) {
+    if (!cls) continue;
+    const native = Object.getOwnPropertyDescriptor(cls.prototype, name);
+    Object.defineProperty(cls.prototype, name, {
+      configurable: true,
+      get() { return native?.get?.call(this) ?? fallback; },
+    });
+  }
+}
+
 try {
   if (!navigator.gpu) throw new Error('This browser has no WebGPU (navigator.gpu is undefined).\n' +
                                       'Use a recent Chrome/Edge, or Firefox/Safari with WebGPU enabled.');
+  shimAdapterInfo();
   const adapter = await navigator.gpu.requestAdapter({ powerPreference: 'high-performance' });
   if (!adapter) throw new Error('no WebGPU adapter available');
   if (!adapter.features.has('float32-filterable')) {
@@ -323,18 +340,6 @@ try {
     requiredLimits,
   });
   device.lost.then((info) => { $('error').textContent = `GPU device lost: ${info.message}`; });
-  // ONNX Runtime reads GPUDevice.adapterInfo from a device it is handed; browsers
-  // that don't implement that (newer) attribute yet get it from adapter.info
-  if (!device.adapterInfo) {
-    const info = adapter.info ?? {};
-    Object.defineProperty(device, 'adapterInfo', {
-      value: {
-        vendor: info.vendor ?? '', architecture: info.architecture ?? '', device: info.device ?? '',
-        description: info.description ?? '', subgroupMinSize: info.subgroupMinSize ?? 4,
-        subgroupMaxSize: info.subgroupMaxSize ?? 128,
-      },
-    });
-  }
   ort.env.webgpu.device = device;
   const t0 = performance.now();
   const [mod, sceneJson] = await Promise.all([import('./features.js'), fetch('scene.json').then((r) => r.json())]);
