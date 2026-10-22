@@ -1,6 +1,8 @@
 // Draws an image straight out of an rdv evaluator's heap region onto a WebGPU
 // canvas - no readback, no CPU pass over the pixels. The canvas' own pixel
 // size is set to the image size (CSS scales it), so one fragment = one pixel.
+// Rows are flipped (image row 0 at the bottom), rendervous' presentation
+// convention.
 //
 //   const display = createDisplay(evaluator.device, canvas);
 //   display.draw(evaluator.region('image'), { width, height, channels, scale, mode, gamma });
@@ -29,7 +31,7 @@ struct Params {
 
 @fragment fn fs(@builtin(position) pos : vec4f) -> @location(0) vec4f {
   let x = min(u32(pos.x), p.width - 1u);
-  let y = min(u32(pos.y), p.height - 1u);
+  let y = p.height - 1u - min(u32(pos.y), p.height - 1u); // row 0 at the bottom
   let at = p.offset + (y * p.width + x) * p.channels;
   var c = vec3f(heap[at]);
   if (p.channels >= 3u) {

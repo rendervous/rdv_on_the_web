@@ -78,7 +78,8 @@ const num = (id) => Number($(id).value);
 // ---------------------------------------------------------------- camera
 // Orbit camera around `target`. rdv's own camera convention (see
 // shaders/rendering/cameras.h, reproduced by RadianceView) maps screen right
-// to cross(up, forward) and screen down to the camera's up axis, so mouse
+// to cross(up, forward) and screen down to
+// the camera's down axis (the image is presented with row 0 at the bottom), so mouse
 // motion is converted through those same two axes.
 const DEFAULT = { yaw: 0.6, pitch: 0.15, distance: 3.0, target: [0, 0, 0] };
 const cam = structuredClone(DEFAULT);
@@ -95,7 +96,7 @@ function origin() {
 function screenAxes() {
   const forward = normalize(sub(cam.target, origin()));
   const right = normalize(cross(UP, forward));
-  return { right, down: cross(forward, right) };
+  return { right, down: cross(right, forward) };
 }
 function lightDirection() {
   const az = num('azimuth') * Math.PI / 180, el = num('elevation') * Math.PI / 180;
@@ -129,7 +130,7 @@ canvas.addEventListener('pointermove', (e) => {
     cam.target = add(add(cam.target, right, -dx * worldPerPixel), down, -dy * worldPerPixel);
   } else {
     cam.yaw += dx / pixels * Math.PI;
-    cam.pitch = Math.max(-1.5, Math.min(1.5, cam.pitch - dy / pixels * Math.PI));
+    cam.pitch = Math.max(-1.5, Math.min(1.5, cam.pitch + dy / pixels * Math.PI));
   }
   restart = true;
 });

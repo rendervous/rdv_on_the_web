@@ -141,7 +141,8 @@ applyPreset();
 // Orbit camera around `target` - same (alpha, beta, distance) parametrization
 // as the inspector's usc2dir camera. rdv's own camera convention (see
 // shaders/rendering/cameras.h, reproduced by FeatureView) maps screen right to
-// cross(up, forward) and screen down to the camera's up axis, so mouse motion
+// cross(up, forward) and screen down to
+// the camera's down axis (the image is presented with row 0 at the bottom), so mouse motion
 // is converted through those same two axes.
 const DEFAULT = { alpha: 0.0, beta: -0.4, distance: 2.7, target: [0, 0, 0] };
 const cam = structuredClone(DEFAULT);
@@ -156,7 +157,7 @@ const origin = () => add(cam.target, usc2dir(cam.alpha, cam.beta), cam.distance)
 function screenAxes() {
   const forward = normalize(sub(cam.target, origin()));
   const right = normalize(cross(UP, forward));
-  return { right, down: cross(forward, right) };
+  return { right, down: cross(right, forward) };
 }
 
 let restart = true;
@@ -184,7 +185,7 @@ canvas.addEventListener('pointermove', (e) => {
     cam.target = add(add(cam.target, right, -dx * worldPerPixel), down, -dy * worldPerPixel);
   } else {
     cam.alpha += dx / pixels * Math.PI;
-    cam.beta = Math.max(-1.5, Math.min(1.5, cam.beta - dy / pixels * Math.PI));
+    cam.beta = Math.max(-1.5, Math.min(1.5, cam.beta + dy / pixels * Math.PI));
   }
   restart = true;
 });
