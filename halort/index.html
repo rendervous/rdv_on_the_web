@@ -40,6 +40,12 @@
   <label><span>Resolution</span>
     <select id="resolution"><option selected>256</option><option>512</option></select>
   </label>
+  <label><span>Network precision</span>
+    <select id="precision">
+      <option value="fp32" selected>fp32</option>
+      <option value="fp16">fp16 (needs shader-f16; faster on some GPUs)</option>
+    </select>
+  </label>
   <label><span>Max frames <b id="maxSppOut"></b></span>
     <input id="maxSpp" type="range" min="1" max="256" step="1" value="64">
   </label>
@@ -146,7 +152,7 @@ canvas.addEventListener('wheel', (e) => {
   restart = true;
 }, { passive: false });
 $('reset').onclick = () => { Object.assign(cam, structuredClone(DEFAULT)); restart = true; };
-for (const id of ['resolution', 'sun', 'sky', 'lightA', 'lightB', 'density', 'g', 'albedo', 'envSamples', 'fov']) {
+for (const id of ['resolution', 'precision', 'sun', 'sky', 'lightA', 'lightB', 'density', 'g', 'albedo', 'envSamples', 'fov']) {
   $(id).oninput = () => { restart = true; };
 }
 for (const id of ['exposure', 'maxSpp']) $(id).oninput = () => { retonemap = true; };
@@ -201,29 +207,49 @@ const ACCUMULATE = /* wgsl */ `
   if (id.x < arrayLength(&accum)) { accum[id.x] += radiance[id.x]; }
 }`;
 
+// fp32 or fp16 HaloRT graph (fp16 is the precision HaloScatNet2 itself runs
+// at; it needs shader-f16). Every input/output is a fixed GPU buffer. Not
+// using ORT's graph capture: in onnxruntime-web 1.30 its replays kept reading
+// the first frame's features instead of the input buffer's current content.
+const precision = () => $('precision').value;
+
 async function sessionFor(size) {
-  if (sessions[size]) return sessions[size];
+  const key = `${size}-${precision()}`;
+  if (sessions[key]) return sessions[key];
   const t0 = performance.now();
-  stats.textContent = `loading HaloRT ${size}×${size}…`;
-  const session = await ort.InferenceSession.create(`halort_${size}.onnx`, {
+  stats.textContent = `loading HaloRT ${size}×${size} (${precision()})…`;
+  const session = await ort.InferenceSession.create(`halort_${size}${precision() === 'fp16' ? '_fp16' : ''}.onnx`, {
     executionProviders: [{ name: 'webgpu', device }], // our device: ORT reads the features buffer directly
     preferredOutputLocation: 'gpu-buffer',
   });
-  const bytes = 17 * size * size * 4;
-  const input = device.createBuffer({ size: bytes, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC });
-  const inputTensor = ort.Tensor.fromGpuBuffer(input, { dataType: 'float32', dims: [1, 17, size, size] });
-  // COPY_SRC: lets window.halort.meanRadiance() read it back
-  const accum = device.createBuffer({ size: 3 * size * size * 4,
-                                      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC });
-  sessions[size] = { session, input, inputTensor, accum };
-  loadInfo = `\nHaloRT ${size}: model load ${(performance.now() - t0).toFixed(0)} ms` + loadInfo.replace(/\nHaloRT \d+.*$/m, '');
-  return sessions[size];
+  const U = GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC;
+  const buffer = (bytes) => device.createBuffer({ size: Math.max(bytes, 16), usage: U });
+  const tensor = (b, dims) => ort.Tensor.fromGpuBuffer(b, { dataType: 'float32', dims });
+  const input = buffer(17 * size * size * 4);
+  const light = buffer(12), sky = buffer(12);
+  const output = buffer(3 * size * size * 4);
+  const accum = buffer(3 * size * size * 4); // COPY_SRC: lets window.halort.meanRadiance() read it back
+  sessions[key] = {
+    session, input, light, sky, output, accum,
+    feeds: { condition: tensor(input, [1, 17, size, size]), light_intensity: tensor(light, [3]),
+             environment_scale: tensor(sky, [3]) },
+    fetches: { radiance: tensor(output, [1, 3, size, size]) },
+    accumulate: device.createBindGroup({
+      layout: accumulatePipeline.getBindGroupLayout(0),
+      entries: [{ binding: 0, resource: { buffer: output } }, { binding: 1, resource: { buffer: accum } }],
+    }),
+  };
+  loadInfo = `\nHaloRT ${size} (${precision()}): model load ${(performance.now() - t0).toFixed(0)} ms` +
+             loadInfo.replace(/\nHaloRT \d+.*$/m, '');
+  return sessions[key];
 }
 
 async function step() {
   const t0 = performance.now();
   const size = num('resolution');
   const s = await sessionFor(size);
+  // A change while this frame renders sets `restart` again: this frame still
+  // gets shown (so the view follows a drag), and the next one starts over.
   if (restart) {
     restart = false;
     spp = 0;
@@ -249,36 +275,29 @@ async function step() {
   encoder.copyBufferToBuffer(region.buffer, region.offset, s.input, 0, 17 * size * size * 4);
   device.queue.submit([encoder.finish()]);
   const sun = Math.pow(2, num('sun')), sky = Math.pow(2, num('sky'));
-  const result = await s.session.run({
-    condition: s.inputTensor,
-    light_intensity: new ort.Tensor('float32', Float32Array.from(scene.light_intensity, (x) => x * sun), [3]),
-    environment_scale: new ort.Tensor('float32', Float32Array.from(scene.environment_scale, (x) => x * sky), [3]),
-  });
-  const radiance = result.radiance;
+  device.queue.writeBuffer(s.light, 0, Float32Array.from(scene.light_intensity, (x) => x * sun));
+  device.queue.writeBuffer(s.sky, 0, Float32Array.from(scene.environment_scale, (x) => x * sky));
+  await s.session.run(s.feeds, s.fetches);
   await device.queue.onSubmittedWorkDone();
   const t2 = performance.now();
   // 3) accumulate + draw
   encoder = device.createCommandEncoder();
   const pass = encoder.beginComputePass();
   pass.setPipeline(accumulatePipeline);
-  pass.setBindGroup(0, device.createBindGroup({
-    layout: accumulatePipeline.getBindGroupLayout(0),
-    entries: [{ binding: 0, resource: { buffer: radiance.gpuBuffer } }, { binding: 1, resource: { buffer: s.accum } }],
-  }));
+  pass.setBindGroup(0, s.accumulate);
   pass.dispatchWorkgroups(Math.ceil(3 * size * size / 256));
   pass.end();
   device.queue.submit([encoder.finish()]);
-  if (!restart) spp++;
+  spp++;
   draw();
   await device.queue.onSubmittedWorkDone();
-  radiance.dispose();
   const t3 = performance.now();
   showStats({ w: size, h: size, features: t1 - ta, network: t2 - t1, draw: t3 - t2, total: t3 - t0, end: t3 });
 }
 
 function draw() {
   const size = num('resolution');
-  const s = sessions[size];
+  const s = sessions[`${size}-${precision()}`];
   if (!s || spp === 0) return;
   display.draw({ buffer: s.accum, offset: 0 }, {
     width: size, height: size, channels: 3, planar: true,
@@ -341,6 +360,7 @@ try {
   });
   device.lost.then((info) => { $('error').textContent = `GPU device lost: ${info.message}`; });
   ort.env.webgpu.device = device;
+  if (!device.features.has('shader-f16')) $('precision').querySelector('[value=fp16]').disabled = true;
   const t0 = performance.now();
   const [mod, sceneJson] = await Promise.all([import('./features.js'), fetch('scene.json').then((r) => r.json())]);
   scene = sceneJson;
@@ -356,7 +376,7 @@ try {
   // for tests/inspection from the console: mean of the accumulated radiance
   window.halort = {
     async meanRadiance() {
-      const s = sessions[num('resolution')];
+      const s = sessions[`${num('resolution')}-${precision()}`];
       const staging = device.createBuffer({ size: s.accum.size, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
       const encoder = device.createCommandEncoder();
       encoder.copyBufferToBuffer(s.accum, 0, staging, 0, s.accum.size);

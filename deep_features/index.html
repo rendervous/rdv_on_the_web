@@ -282,7 +282,7 @@ async function step() {
   await evaluator.evaluate({ image: { bytes: w * h * 12, clear }, accumulate: 1, ...inputs(w, h) },
                            { threads: [w, h], repeat: k, readback: false });
   const t1 = performance.now();
-  if (!restart) spp += k; // a change during the dispatch restarts accumulation on the next step anyway
+  spp += k; // shown even if something changed meanwhile (the view follows a drag); the next step restarts
   draw();
   const t2 = performance.now();
   perFrame = Math.max(1, Math.min(64, Math.round(k * FRAME_BUDGET_MS / Math.max(t1 - t0, 0.5))));
