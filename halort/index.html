@@ -323,6 +323,18 @@ try {
     requiredLimits,
   });
   device.lost.then((info) => { $('error').textContent = `GPU device lost: ${info.message}`; });
+  // ONNX Runtime reads GPUDevice.adapterInfo from a device it is handed; browsers
+  // that don't implement that (newer) attribute yet get it from adapter.info
+  if (!device.adapterInfo) {
+    const info = adapter.info ?? {};
+    Object.defineProperty(device, 'adapterInfo', {
+      value: {
+        vendor: info.vendor ?? '', architecture: info.architecture ?? '', device: info.device ?? '',
+        description: info.description ?? '', subgroupMinSize: info.subgroupMinSize ?? 4,
+        subgroupMaxSize: info.subgroupMaxSize ?? 128,
+      },
+    });
+  }
   ort.env.webgpu.device = device;
   const t0 = performance.now();
   const [mod, sceneJson] = await Promise.all([import('./features.js'), fetch('scene.json').then((r) => r.json())]);
