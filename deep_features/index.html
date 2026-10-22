@@ -115,12 +115,12 @@
 </aside>
 
 <script type="module">
+import { createDisplay } from '../common/display.js';
 const FEATURES = ['depth', 'dp1', 'dp2', 'red_tr', 'eff_tr', 'nee', 'env_r', 'env_g', 'env_b',
                   'sa_r', 'sa_g', 'sa_b', 'T'];
 const $ = (id) => document.getElementById(id);
 const stats = $('stats');
 const canvas = $('canvas');
-const ctx = canvas.getContext('2d');
 const num = (id) => Number($(id).value);
 const flag = (id) => ($(id).checked ? 1 : 0);
 
@@ -216,6 +216,24 @@ function updateLabels() {
   $('fovOut').textContent = `${num('fov')}°`;
 }
 
+// ---------------------------------------------------------------- case
+const statsExtra = () => `\nRGB = ${[num('chR'), num('chG'), num('chB')].map((i) => FEATURES[i]).join(' / ')}`;
+const displayParams = () => ({ scale: Math.pow(2, num('scale')) / Math.max(spp, 1), mode: 0, gamma: $('gamma').checked });
+const inputs = (w, h) => ({
+  origin: origin(), target: cam.target, up: UP, fov: num('fov') * Math.PI / 180, width: w, height: h,
+  channel_r: num('chR'), channel_g: num('chG'), channel_b: num('chB'),
+  'map.density_scale': Math.pow(10, num('density')),
+  'map.g': num('g'),
+  'map.scattering_albedo.albedo': [albedo('albR'), albedo('albG'), albedo('albB')],
+  'map.light_direction': usc2dir(num('lightA'), num('lightB')),
+  'map.sample_index': num('sampleIndex'),
+  'map.step_size': num('step'),
+  'map.use_depth_encoding': flag('useDepthEncoding'),
+  'map.use_reduced_transmittance': flag('useReducedTransmittance'),
+  'map.use_similarity_anisotropy': flag('useSimilarityAnisotropy'),
+  'map.use_scattering_accumulation': flag('useScatteringAccumulation'),
+});
+
 // ---------------------------------------------------------------- timings
 const history = [];
 const avg = (key) => history.reduce((s, h) => s + h[key], 0) / Math.max(history.length, 1);
@@ -228,72 +246,46 @@ function showStats(last) {
   const h = history.at(-1);
   if (!h) return;
   const span = (h.end - history[0].end) / 1000;
-  const rate = history.length > 1 && span > 0 ? (history.length - 1) / span : 0;
+  const samples = history.slice(1).reduce((s, x) => s + x.k, 0);
+  const rate = span > 0 ? samples / span : 0;
   const done = spp >= num('maxSpp') ? '  (done)' : '';
-  const names = [num('chR'), num('chG'), num('chB')].map((i) => FEATURES[i]).join(' / ');
   stats.textContent =
-    `${h.w}×${h.h} px   ${spp} spp${done}\nRGB = ${names}\n` +
-    `evaluate (1 spp, GPU+readback) ${h.evaluate.toFixed(2).padStart(7)} ms  avg ${avg('evaluate').toFixed(2)}\n` +
-    `accumulate + canvas draw       ${h.draw.toFixed(2).padStart(7)} ms  avg ${avg('draw').toFixed(2)}\n` +
-    `frame total                    ${h.total.toFixed(2).padStart(7)} ms  avg ${avg('total').toFixed(2)}\n` +
-    `samples/s ${rate.toFixed(1)}\n` + loadInfo;
+    `${h.w}×${h.h} px   ${spp} spp${done}${statsExtra()}\n` +
+    `evaluate (${String(h.k).padStart(2)} spp, GPU) ${h.evaluate.toFixed(2).padStart(7)} ms  ` +
+    `= ${(h.evaluate / h.k).toFixed(2)} ms/sample\n` +
+    `canvas draw            ${h.draw.toFixed(2).padStart(7)} ms  avg ${avg('draw').toFixed(2)}\n` +
+    `frame total            ${h.total.toFixed(2).padStart(7)} ms  avg ${avg('total').toFixed(2)}\n` +
+    `samples/s ${rate.toFixed(1)}   Mrays/s ${(rate * h.w * h.h / 1e6).toFixed(2)}\n` + loadInfo;
 }
 
 // ---------------------------------------------------------------- render
-let evaluator, sample, accum, pixels, imageData, spp = 0;
-function buffersFor(w, h) {
-  if (sample && sample.length === w * h * 3) return;
-  canvas.width = w; canvas.height = h;
-  sample = new Float32Array(w * h * 3);
-  accum = new Float32Array(w * h * 3);
-  imageData = ctx.createImageData(w, h);
-  pixels = new Uint32Array(imageData.data.buffer);
-}
+// Everything stays on the GPU: the kernel adds each sample into a resident
+// heap region (accumulate = 1), several samples per frame in one submit
+// (sized to ~FRAME_BUDGET_MS of GPU work), and the running sum is drawn
+// straight onto the WebGPU canvas divided by spp - no readback.
+const FRAME_BUDGET_MS = 14;
+let evaluator, display, spp = 0, perFrame = 1;
 
-const LINEAR = Uint8Array.from({ length: 4096 }, (_, i) => Math.round(255 * i / 4095));
-const GAMMA = Uint8Array.from({ length: 4096 }, (_, i) => Math.round(255 * Math.pow(i / 4095, 1 / 2.2)));
-function present() {
-  const scale = 4095 * Math.pow(2, num('scale')) / Math.max(spp, 1);
-  const lut = $('gamma').checked ? GAMMA : LINEAR;
-  const q = (v) => lut[Math.max(0, Math.min(4095, (v * scale) | 0))];
-  for (let p = 0, i = 0; p < pixels.length; p++, i += 3) {
-    pixels[p] = 0xff000000 | (q(accum[i + 2]) << 16) | (q(accum[i + 1]) << 8) | q(accum[i]);
-  }
-  ctx.putImageData(imageData, 0, 0);
-}
+const draw = () => {
+  const w = num('resolution');
+  display.draw(evaluator.region('image'), { width: w, height: w, channels: 3, ...displayParams() });
+};
 
 async function step() {
   const t0 = performance.now();
   const w = num('resolution'), h = w;
-  buffersFor(w, h);
-  if (restart) {
-    restart = false;
-    accum.fill(0);
-    spp = 0;
-  }
-  await evaluator.evaluate({
-    image: sample,
-    origin: origin(), target: cam.target, up: UP, fov: num('fov') * Math.PI / 180, width: w, height: h,
-    channel_r: num('chR'), channel_g: num('chG'), channel_b: num('chB'),
-    'map.density_scale': Math.pow(10, num('density')),
-    'map.g': num('g'),
-    'map.scattering_albedo.albedo': [albedo('albR'), albedo('albG'), albedo('albB')],
-    'map.light_direction': usc2dir(num('lightA'), num('lightB')),
-    'map.sample_index': num('sampleIndex'),
-    'map.step_size': num('step'),
-    'map.use_depth_encoding': flag('useDepthEncoding'),
-    'map.use_reduced_transmittance': flag('useReducedTransmittance'),
-    'map.use_similarity_anisotropy': flag('useSimilarityAnisotropy'),
-    'map.use_scattering_accumulation': flag('useScatteringAccumulation'),
-  }, { threads: [w, h] });
+  const clear = restart;
+  restart = false;
+  if (clear) spp = 0;
+  const k = Math.max(1, Math.min(perFrame, num('maxSpp') - spp));
+  await evaluator.evaluate({ image: { bytes: w * h * 12, clear }, accumulate: 1, ...inputs(w, h) },
+                           { threads: [w, h], repeat: k, readback: false });
   const t1 = performance.now();
-  if (!restart) { // a change during the dispatch makes this sample stale - drop it
-    for (let i = 0; i < accum.length; i++) accum[i] += sample[i];
-    spp++;
-    present();
-  }
+  if (!restart) spp += k; // a change during the dispatch restarts accumulation on the next step anyway
+  draw();
   const t2 = performance.now();
-  showStats({ w, h, evaluate: t1 - t0, draw: t2 - t1, total: t2 - t0, end: t2 });
+  perFrame = Math.max(1, Math.min(64, Math.round(k * FRAME_BUDGET_MS / Math.max(t1 - t0, 0.5))));
+  showStats({ w, h, k, evaluate: t1 - t0, draw: t2 - t1, total: t2 - t0, end: t2 });
 }
 
 let busy = false;
@@ -303,8 +295,8 @@ function tick() {
     busy = true;
     step().catch((e) => { $('error').textContent = String(e?.stack ?? e); })
           .finally(() => { busy = false; });
-  } else if (retonemap && !busy && accum) {
-    present();
+  } else if (retonemap && !busy && spp > 0) {
+    draw();
     showStats();
   }
   retonemap = false;
@@ -319,6 +311,7 @@ try {
   const mod = await import('./features.js');
   const t1 = performance.now();
   evaluator = await mod.createEvaluator();
+  display = createDisplay(evaluator.device, canvas);
   const t2 = performance.now();
   loadInfo = `\nmodule load   ${(t1 - t0).toFixed(0)} ms\npipeline+heap ${(t2 - t1).toFixed(0)} ms`;
   evaluator.device.lost.then((info) => { $('error').textContent = `GPU device lost: ${info.message}`; });

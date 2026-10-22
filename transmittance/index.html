@@ -55,10 +55,10 @@
 </aside>
 
 <script type="module">
+import { createDisplay } from '../common/display.js';
 const $ = (id) => document.getElementById(id);
 const stats = $('stats');
 const canvas = $('canvas');
-const ctx = canvas.getContext('2d');
 
 // ---------------------------------------------------------------- camera
 // Orbit camera around `target`. rdv's own camera convention (see
@@ -132,42 +132,32 @@ function showStats(last) {
   const fps = history.length > 1 ? (history.length - 1) / span : 0;
   stats.textContent =
     `${last.w}×${last.h} px\n` +
-    `evaluate (GPU+readback) ${last.evaluate.toFixed(2).padStart(7)} ms  avg ${avg('evaluate').toFixed(2)}\n` +
+    `evaluate (GPU)          ${last.evaluate.toFixed(2).padStart(7)} ms  avg ${avg('evaluate').toFixed(2)}\n` +
     `canvas draw             ${last.draw.toFixed(2).padStart(7)} ms  avg ${avg('draw').toFixed(2)}\n` +
     `frame total             ${last.total.toFixed(2).padStart(7)} ms  avg ${avg('total').toFixed(2)}\n` +
     `redraws/s ${fps.toFixed(1)}\n` + loadInfo;
 }
 
 // ---------------------------------------------------------------- render
-let evaluator, image, pixels, imageData;
-function buffersFor(w, h) {
-  if (image && image.length === w * h) return;
-  canvas.width = w; canvas.height = h;
-  image = new Float32Array(w * h);
-  imageData = ctx.createImageData(w, h);
-  pixels = new Uint32Array(imageData.data.buffer);
-}
+// The image stays on the GPU: the kernel writes it into a resident heap
+// region, which is drawn straight onto the WebGPU canvas (no readback).
+let evaluator, display;
 
 async function render() {
   const t0 = performance.now();
   const w = Number($('resolution').value), h = w;
-  buffersFor(w, h);
   const density = Number($('density').value), step = Number($('step').value), fovDeg = Number($('fov').value);
   $('densityOut').textContent = density.toFixed(1);
   $('stepOut').textContent = step.toFixed(3);
   $('fovOut').textContent = `${fovDeg}°`;
   await evaluator.evaluate({
-    image,
+    image: { bytes: w * h * 4 },
     origin: origin(), target: cam.target, up: UP, fov: fovDeg * Math.PI / 180,
     width: w, height: h,
     'map.density_scale': density, 'map.step_size': step,
-  }, { threads: [w, h] });
+  }, { threads: [w, h], readback: false });
   const t1 = performance.now();
-  for (let i = 0; i < image.length; i++) {
-    const v = Math.max(0, Math.min(255, image[i] * 255)) | 0;
-    pixels[i] = 0xff000000 | (v << 16) | (v << 8) | v;
-  }
-  ctx.putImageData(imageData, 0, 0);
+  display.draw(evaluator.region('image'), { width: w, height: h, channels: 1 });
   const t2 = performance.now();
   showStats({ w, h, evaluate: t1 - t0, draw: t2 - t1, total: t2 - t0, end: t2 });
 }
@@ -191,6 +181,7 @@ try {
   const mod = await import('./transmittance.js');
   const t1 = performance.now();
   evaluator = await mod.createEvaluator();
+  display = createDisplay(evaluator.device, canvas);
   const t2 = performance.now();
   loadInfo = `\nmodule load   ${(t1 - t0).toFixed(0)} ms\npipeline+heap ${(t2 - t1).toFixed(0)} ms`;
   evaluator.device.lost.then((info) => { $('error').textContent = `GPU device lost: ${info.message}`; });
