@@ -46,6 +46,13 @@ memory, data) ships as one self-contained JavaScript module.</p>
   probability) - any three mapped to RGB, with the profile's ablation flags and medium/light controls.
 </a>
 
+<a class="card" href="halort/">
+  <h2>HaloRT · neural volume rendering</h2>
+  The full HaloRT pipeline in the browser: rdv computes the deep features of the cloud on the GPU, and the HaloRT
+  network (two UNets, exported to ONNX, run by ONNX Runtime Web on the same WebGPU device) turns them into sun and
+  sky radiance - no data leaves the GPU. Light, medium and camera controls; per-stage timings.
+</a>
+
 <p id="webgpu" class="muted"></p>
 <script>
   document.getElementById('webgpu').textContent = navigator.gpu

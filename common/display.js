@@ -5,10 +5,12 @@
 // convention.
 //
 //   const display = createDisplay(evaluator.device, canvas);
-//   display.draw(evaluator.region('image'), { width, height, channels, scale, mode, gamma });
+//   display.draw(evaluator.region('image'), { width, height, channels, scale, mode, gamma, planar });
 //
 // mode 0: clamp(v * scale), mode 1: 1 - exp(-v * scale) (filmic); gamma applies
-// a 1/2.2 encode after either. A 1-channel image is shown as gray.
+// a 1/2.2 encode after either. A 1-channel image is shown as gray. planar: the
+// image is channels-first ([c][y][x], e.g. a network's NCHW output) instead of
+// interleaved ([y][x][c]).
 
 const SHADER = /* wgsl */ `
 struct Params {
@@ -19,7 +21,7 @@ struct Params {
   scale : f32,
   mode : u32,
   gamma : u32,
-  _pad : u32,
+  planar : u32,
 };
 @group(0) @binding(0) var<storage, read> heap : array<f32>;
 @group(0) @binding(1) var<uniform> p : Params;
@@ -32,10 +34,16 @@ struct Params {
 @fragment fn fs(@builtin(position) pos : vec4f) -> @location(0) vec4f {
   let x = min(u32(pos.x), p.width - 1u);
   let y = p.height - 1u - min(u32(pos.y), p.height - 1u); // row 0 at the bottom
-  let at = p.offset + (y * p.width + x) * p.channels;
+  let pixel = y * p.width + x;
+  var at = p.offset + pixel * p.channels;
+  var stride = 1u;
+  if (p.planar == 1u) {
+    at = p.offset + pixel;
+    stride = p.width * p.height;
+  }
   var c = vec3f(heap[at]);
   if (p.channels >= 3u) {
-    c = vec3f(heap[at], heap[at + 1u], heap[at + 2u]);
+    c = vec3f(heap[at], heap[at + stride], heap[at + 2u * stride]);
   }
   c = c * p.scale;
   if (p.mode == 1u) {
@@ -63,7 +71,7 @@ export function createDisplay(device, canvas) {
   const params = device.createBuffer({ size: 32, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
   let bindGroup = null, boundHeap = null;
 
-  function draw(region, { width, height, channels = 3, scale = 1, mode = 0, gamma = false }) {
+  function draw(region, { width, height, channels = 3, scale = 1, mode = 0, gamma = false, planar = false }) {
     if (!region) return;
     if (canvas.width !== width || canvas.height !== height) {
       canvas.width = width;
@@ -79,7 +87,7 @@ export function createDisplay(device, canvas) {
     const data = new ArrayBuffer(32);
     new Uint32Array(data, 0, 4).set([region.offset / 4, width, height, channels]);
     new Float32Array(data, 16, 1)[0] = scale;
-    new Uint32Array(data, 20, 2).set([mode, gamma ? 1 : 0]);
+    new Uint32Array(data, 20, 3).set([mode, gamma ? 1 : 0, planar ? 1 : 0]);
     device.queue.writeBuffer(params, 0, data);
     const encoder = device.createCommandEncoder();
     const pass = encoder.beginRenderPass({
