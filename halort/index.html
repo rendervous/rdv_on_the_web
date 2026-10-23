@@ -372,6 +372,10 @@ try {
     requiredLimits,
   });
   device.lost.then((info) => { $('error').textContent = `GPU device lost: ${info.message}`; });
+  // which GPU the browser gave us (on Windows, powerPreference is ignored)
+  const gpuInfo = device.adapterInfo ?? adapter.info ?? {};
+  const gpuName = [gpuInfo.vendor, gpuInfo.architecture, gpuInfo.description].filter(Boolean).join(' ') || 'unknown';
+  const gpuLine = `\nGPU: ${gpuName}${device.features.has('shader-f16') ? '' : ' (no shader-f16)'}`;
   ort.env.webgpu.device = device;
   if (!device.features.has('shader-f16')) $('precision').querySelector('[value=fp16]').disabled = true;
   const t0 = performance.now();
@@ -384,7 +388,7 @@ try {
   accumulatePipeline = device.createComputePipeline({
     layout: 'auto', compute: { module: device.createShaderModule({ code: ACCUMULATE }), entryPoint: 'main' },
   });
-  loadInfo = `\nfeatures load ${(t1 - t0).toFixed(0)} ms, pipeline+heap ${(t2 - t1).toFixed(0)} ms`;
+  loadInfo = gpuLine + `\nfeatures load ${(t1 - t0).toFixed(0)} ms, pipeline+heap ${(t2 - t1).toFixed(0)} ms`;
   await sessionFor(num('resolution'));
   // for tests/inspection from the console: mean of the accumulated radiance
   window.halort = {
