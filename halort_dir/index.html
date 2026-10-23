@@ -47,6 +47,7 @@
       <option value="fp16">fp16 (needs shader-f16; faster on some GPUs)</option>
     </select>
   </label>
+  <label class="check"><input id="replay" type="checkbox" checked> replay cache (record ORT's GPU work once, replay it)</label>
   <label><span>Max frames <b id="maxSppOut"></b></span>
     <input id="maxSpp" type="range" min="1" max="256" step="1" value="64">
   </label>
@@ -99,6 +100,7 @@
 <script type="module">
 import * as ort from 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.30.0/dist/ort.webgpu.min.mjs';
 import { createDisplay } from '../common/display.js';
+import { createOrtRecorder, maxAbsDiff } from '../common/ort_replay.js';
 
 const $ = (id) => document.getElementById(id);
 const stats = $('stats');
@@ -163,7 +165,7 @@ for (const id of ['resolution', 'precision', 'sun', 'lightA', 'lightB', 'clip', 
                   'albedo', 'fov']) {
   $(id).oninput = () => { restart = true; };
 }
-for (const id of ['exposure', 'maxSpp']) $(id).oninput = () => { retonemap = true; };
+for (const id of ['exposure', 'maxSpp', 'replay']) $(id).oninput = () => { retonemap = true; };
 
 const albedo = () => 1 - Math.pow(10, num('albedo'));
 function updateLabels() {
@@ -201,7 +203,7 @@ function showStats(last) {
     `network (HaloRT dir)  ${h.network.toFixed(2).padStart(7)} ms  avg ${avg('network').toFixed(2)}\n` +
     `accumulate + draw     ${h.draw.toFixed(2).padStart(7)} ms  avg ${avg('draw').toFixed(2)}\n` +
     `frame total           ${h.total.toFixed(2).padStart(7)} ms  avg ${avg('total').toFixed(2)}\n` +
-    `frames/s ${rate.toFixed(1)}\n` + loadInfo;
+    `frames/s ${rate.toFixed(1)}\n` + loadInfo + ($('replay').checked ? replayInfo : '');
 }
 
 // ---------------------------------------------------------------- pipeline
@@ -210,7 +212,8 @@ function showStats(last) {
 const SCENE = {"camera": [0.0, 0.3, 2.7], "light": [-1.2, 0.5], "light_intensity": [1.0, 1.0, 1.0], "clip": [0.6, 0.4, 0.0], "density_scale": 200.0, "albedo": 0.99, "g": 0.3};
 let device, features, display, scene, spp = 0;
 const sessions = {};  // size -> { session, input (GPUBuffer), inputTensor, accum (GPUBuffer) }
-let accumulatePipeline;
+let accumulatePipeline, recorder;
+let replayInfo = '';
 
 const ACCUMULATE = /* wgsl */ `
 @group(0) @binding(0) var<storage, read> radiance : array<f32>;
@@ -245,6 +248,7 @@ async function sessionFor(size) {
     session, input, light, output, accum,
     feeds: { condition: tensor(input, [1, 14, size, size]), light_intensity: tensor(light, [3]) },
     fetches: { radiance: tensor(output, [1, 3, size, size]) },
+    check: buffer(3 * size * size * 4), warm: false,
     accumulate: device.createBindGroup({
       layout: accumulatePipeline.getBindGroupLayout(0),
       entries: [{ binding: 0, resource: { buffer: output } }, { binding: 1, resource: { buffer: accum } }],
@@ -253,6 +257,37 @@ async function sessionFor(size) {
   loadInfo = `\nHaloRT ${size} (${precision()}): model load ${(performance.now() - t0).toFixed(0)} ms` +
              loadInfo.replace(/\nHaloRT \d+.*$/m, '');
   return sessions[key];
+}
+
+// The network: ONNX Runtime once (warm-up), then once more while recording
+// its GPU work; later frames replay the recording (common/ort_replay.js),
+// which skips ORT's per-kernel CPU work. The recording is checked against the
+// ORT run it came from and must reproduce it exactly.
+async function network(s) {
+  if (!$('replay').checked || !s.warm) {
+    await s.session.run(s.feeds, s.fetches);
+    recorder.plainRun();
+    s.warm = true;
+    return;
+  }
+  if (!s.replay || s.replay.stale) {
+    const replay = await recorder.record(() => s.session.run(s.feeds, s.fetches));
+    const encoder = device.createCommandEncoder();
+    encoder.copyBufferToBuffer(s.output, 0, s.check, 0, s.output.size);
+    device.queue.submit([encoder.finish()]);
+    replay.run();
+    const diff = await maxAbsDiff(device, s.output, s.check);
+    if (diff !== 0) {
+      $('replay').checked = false;
+      $('replay').disabled = true;
+      replayInfo = `\nreplay cache disabled: it differs from ORT (max |diff| ${diff})`;
+      return;
+    }
+    s.replay = replay;
+    replayInfo = `\nreplay cache: ${replay.stats.dispatches} kernels in 1 submit (verified against ORT)`;
+    return;
+  }
+  s.replay.run();
 }
 
 async function step() {
@@ -288,7 +323,7 @@ async function step() {
   device.queue.submit([encoder.finish()]);
   const sun = Math.pow(2, num('sun'));
   device.queue.writeBuffer(s.light, 0, Float32Array.from(scene.light_intensity, (x) => x * sun));
-  await s.session.run(s.feeds, s.fetches);
+  await network(s);
   await device.queue.onSubmittedWorkDone();
   const t2 = performance.now();
   // 3) accumulate + draw
@@ -393,6 +428,7 @@ try {
   features = await mod.createEvaluator(device);
   const t2 = performance.now();
   display = createDisplay(device, canvas);
+  recorder = createOrtRecorder(device);
   accumulatePipeline = device.createComputePipeline({
     layout: 'auto', compute: { module: device.createShaderModule({ code: ACCUMULATE }), entryPoint: 'main' },
   });
