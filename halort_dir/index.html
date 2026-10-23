@@ -184,8 +184,14 @@ function updateLabels() {
 }
 
 // ---------------------------------------------------------------- timings
+// Frames are submitted without waiting for the GPU, up to IN_FLIGHT at once
+// (triple buffering: the CPU prepares the next frame while the GPU still runs
+// the previous ones), and shown once per display refresh. Stage times come
+// from GPU timestamps (if the device has timestamp-query), the frame rate from
+// when frames finish on the GPU.
+const IN_FLIGHT = 3;
 const history = [];
-const avg = (key) => history.reduce((s, h) => s + h[key], 0) / Math.max(history.length, 1);
+const avg = (key) => history.reduce((s, h) => s + (h[key] ?? 0), 0) / Math.max(history.length, 1);
 let loadInfo = '';
 function showStats(last) {
   if (last) {
@@ -194,16 +200,72 @@ function showStats(last) {
   }
   const h = history.at(-1);
   if (!h) return;
-  const span = (h.end - history[0].end) / 1000;
-  const rate = history.length > 1 && span > 0 ? (history.length - 1) / span : 0;
+  const interval = history.length > 1 ? (h.end - history[0].end) / (history.length - 1) : 0;
+  const ms = (k) => (h[k] === undefined ? '      - ms' : `${h[k].toFixed(2).padStart(7)} ms  avg ${avg(k).toFixed(2)}`);
   const done = spp >= num('maxSpp') ? '  (done)' : '';
+  const busy = h.gpu !== undefined && interval > 0 ? `, GPU busy ${Math.min(100, 100 * avg('gpu') / interval).toFixed(0)}%` : '';
   stats.textContent =
     `${h.w}×${h.h} px   ${spp} frames${done}\n` +
-    `features (rdv)        ${h.features.toFixed(2).padStart(7)} ms  avg ${avg('features').toFixed(2)}\n` +
-    `network (HaloRT dir)  ${h.network.toFixed(2).padStart(7)} ms  avg ${avg('network').toFixed(2)}\n` +
-    `accumulate + draw     ${h.draw.toFixed(2).padStart(7)} ms  avg ${avg('draw').toFixed(2)}\n` +
-    `frame total           ${h.total.toFixed(2).padStart(7)} ms  avg ${avg('total').toFixed(2)}\n` +
-    `frames/s ${rate.toFixed(1)}\n` + loadInfo + ($('replay').checked ? replayInfo : '');
+    `features (rdv)        ${ms('features')}\n` +
+    `network (HaloRT dir)  ${ms('network')}\n` +
+    `accumulate            ${ms('accumulate')}\n` +
+    `GPU per frame         ${ms('gpu')}\n` +
+    `CPU per frame         ${ms('cpu')}\n` +
+    `frame interval ${interval.toFixed(2)} ms (${interval > 0 ? (1000 / interval).toFixed(1) : '0'} frames/s${busy})\n` +
+    loadInfo + ($('replay').checked ? replayInfo : '');
+}
+
+// per-frame GPU timestamps: 0 start, 1 features done, 2 network done, 3 accumulated
+let timer = null;
+function createTimer() {
+  if (!device.features.has('timestamp-query')) return null;
+  const free = [];
+  return {
+    acquire: () => free.pop() ?? {
+      queries: device.createQuerySet({ type: 'timestamp', count: 4 }),
+      resolve: device.createBuffer({ size: 32, usage: GPUBufferUsage.QUERY_RESOLVE | GPUBufferUsage.COPY_SRC }),
+      read: device.createBuffer({ size: 32, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST }),
+    },
+    release: (t) => free.push(t),
+  };
+}
+function mark(frame, i) {
+  if (!frame.t) return;
+  const encoder = device.createCommandEncoder();
+  encoder.beginComputePass({ timestampWrites: { querySet: frame.t.queries, beginningOfPassWriteIndex: i } }).end();
+  if (i === 3) {
+    encoder.resolveQuerySet(frame.t.queries, 0, 4, frame.t.resolve, 0);
+    encoder.copyBufferToBuffer(frame.t.resolve, 0, frame.t.read, 0, 32);
+  }
+  device.queue.submit([encoder.finish()]);
+}
+const inFlight = new Set();
+let frameCount = 0;
+function beginFrame() {
+  const frame = { t: timer?.acquire() ?? null, t0: performance.now() };
+  mark(frame, 0);
+  return frame;
+}
+function endFrame(frame, info) {
+  mark(frame, 3);
+  frameCount++;
+  info.cpu = performance.now() - frame.t0;
+  const done = (async () => {
+    if (frame.t) {
+      await frame.t.read.mapAsync(GPUMapMode.READ);
+      const q = new BigInt64Array(frame.t.read.getMappedRange().slice(0));
+      frame.t.read.unmap();
+      timer.release(frame.t);
+      const d = (a, b) => Math.max(0, Number(q[b] - q[a]) / 1e6);
+      Object.assign(info, { features: d(0, 1), network: d(1, 2), accumulate: d(2, 3), gpu: d(0, 3) });
+    } else {
+      await device.queue.onSubmittedWorkDone();
+    }
+    info.end = performance.now();
+    showStats(info);
+  })();
+  inFlight.add(done);
+  done.finally(() => inFlight.delete(done));
 }
 
 // ---------------------------------------------------------------- pipeline
@@ -291,7 +353,6 @@ async function network(s) {
 }
 
 async function step() {
-  const t0 = performance.now();
   const size = num('resolution');
   const s = await sessionFor(size);
   // A change while this frame renders sets `restart` again: this frame still
@@ -303,7 +364,7 @@ async function step() {
     encoder.clearBuffer(s.accum);
     device.queue.submit([encoder.finish()]);
   }
-  const ta = performance.now();
+  const frame = beginFrame();
   // 1) features: 14 x H x W, written by the rdv kernel into a resident heap region
   await features.evaluate({
     condition: { bytes: 14 * size * size * 4 },
@@ -314,8 +375,8 @@ async function step() {
     'map.scattering_albedo.albedo': [albedo(), albedo(), albedo()],
     'map.clip_direction': $('clip').checked ? usc2dir(num('clipA'), num('clipB')) : [0, 0, 0],
     'map.clip_distance': num('clipD'),
-  }, { threads: [size, size], readback: false });
-  const t1 = performance.now();
+  }, { threads: [size, size], readback: false, wait: false });
+  mark(frame, 1);
   // 2) network: the features region becomes the ONNX input (GPU copy, same device)
   const region = features.region('condition');
   let encoder = device.createCommandEncoder();
@@ -324,9 +385,8 @@ async function step() {
   const sun = Math.pow(2, num('sun'));
   device.queue.writeBuffer(s.light, 0, Float32Array.from(scene.light_intensity, (x) => x * sun));
   await network(s);
-  await device.queue.onSubmittedWorkDone();
-  const t2 = performance.now();
-  // 3) accumulate + draw
+  mark(frame, 2);
+  // 3) accumulate (shown by the next display refresh)
   encoder = device.createCommandEncoder();
   const pass = encoder.beginComputePass();
   pass.setPipeline(accumulatePipeline);
@@ -335,10 +395,7 @@ async function step() {
   pass.end();
   device.queue.submit([encoder.finish()]);
   spp++;
-  draw();
-  await device.queue.onSubmittedWorkDone();
-  const t3 = performance.now();
-  showStats({ w: size, h: size, features: t1 - ta, network: t2 - t1, draw: t3 - t2, total: t3 - t0, end: t3 });
+  endFrame(frame, { w: size, h: size });
 }
 
 function draw() {
@@ -351,12 +408,15 @@ function draw() {
   });
 }
 
-let busy = false;
-function tick() {
-  updateLabels();
-  if (!busy && (restart || spp < num('maxSpp'))) {
-    busy = true;
-    step().catch((e) => {
+const nextTask = () => new Promise((r) => { const c = new MessageChannel(); c.port1.onmessage = () => r(); c.port2.postMessage(0); });
+const nextRefresh = () => new Promise((r) => requestAnimationFrame(r));
+async function renderLoop() {
+  for (;;) {
+    if (!restart && spp >= num('maxSpp')) { await nextRefresh(); continue; }
+    while (inFlight.size >= IN_FLIGHT) await Promise.race(inFlight);
+    try {
+      await step();
+    } catch (e) {
       if (precision() === 'fp16') {
         // fp16 kernels don't compile on every browser/GPU (e.g. some DXC
         // versions reject ORT's fp16 shaders): continue in fp32 instead
@@ -364,13 +424,22 @@ function tick() {
         $('precision').querySelector('[value=fp16]').disabled = true;
         $('error').textContent = `fp16 is not supported by this browser/GPU (${String(e?.message ?? e).split(String.fromCharCode(10))[0].slice(0, 160)}…) - using fp32.`;
         restart = true;
-        return;
+        continue;
       }
       $('error').textContent = String(e?.stack ?? e);
-    }).finally(() => { busy = false; });
-  } else if (retonemap && !busy) {
+      await nextRefresh();
+    }
+    await nextTask(); // let input events in
+  }
+}
+
+let drawn = -1;
+function tick() {
+  updateLabels();
+  if ((drawn !== frameCount || retonemap) && !recorder?.recording) { // no GPU work while ORT is recorded
     draw();
-    showStats();
+    drawn = frameCount;
+    if (retonemap) showStats();
   }
   retonemap = false;
   requestAnimationFrame(tick);
@@ -451,7 +520,9 @@ try {
       return { mean: sum / n / spp, frames: spp };
     },
   };
+  timer = createTimer();
   requestAnimationFrame(tick);
+  renderLoop();
 } catch (e) {
   stats.textContent = 'failed';
   $('error').textContent = String(e?.stack ?? e);

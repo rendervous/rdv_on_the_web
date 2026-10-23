@@ -114,6 +114,9 @@ export function createOrtRecorder(device) {
     // marks an ORT run made without recording: it may reuse pooled buffers
     // that existing replays depend on
     plainRun() { epoch++; },
+    // true while record() runs: the caller must not use the device meanwhile
+    // (everything submitted then would become part of the recording)
+    get recording() { return active !== null; },
     async record(run) {
       if (active) throw new Error('a recording is already in progress');
       epoch++;
