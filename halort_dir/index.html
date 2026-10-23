@@ -321,8 +321,18 @@ function tick() {
   updateLabels();
   if (!busy && (restart || spp < num('maxSpp'))) {
     busy = true;
-    step().catch((e) => { $('error').textContent = String(e?.stack ?? e); })
-          .finally(() => { busy = false; });
+    step().catch((e) => {
+      if (precision() === 'fp16') {
+        // fp16 kernels don't compile on every browser/GPU (e.g. some DXC
+        // versions reject ORT's fp16 shaders): continue in fp32 instead
+        $('precision').value = 'fp32';
+        $('precision').querySelector('[value=fp16]').disabled = true;
+        $('error').textContent = `fp16 is not supported by this browser/GPU (${String(e?.message ?? e).split(String.fromCharCode(10))[0].slice(0, 160)}…) - using fp32.`;
+        restart = true;
+        return;
+      }
+      $('error').textContent = String(e?.stack ?? e);
+    }).finally(() => { busy = false; });
   } else if (retonemap && !busy) {
     draw();
     showStats();
