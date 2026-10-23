@@ -205,6 +205,9 @@ function showStats(last) {
 }
 
 // ---------------------------------------------------------------- pipeline
+// the exported scene's light/environment scales (from scene.json, inlined so
+// the page needs no extra request)
+const SCENE = {"camera": [0.0, 0.3, 2.7], "light": [-1.2, 0.5], "light_intensity": [1.0, 1.0, 1.0], "clip": [0.6, 0.4, 0.0], "density_scale": 200.0, "albedo": 0.99, "g": 0.3};
 let device, features, display, scene, spp = 0;
 const sessions = {};  // size -> { session, input (GPUBuffer), inputTensor, accum (GPUBuffer) }
 let accumulatePipeline;
@@ -370,8 +373,8 @@ try {
   ort.env.webgpu.device = device;
   if (!device.features.has('shader-f16')) $('precision').querySelector('[value=fp16]').disabled = true;
   const t0 = performance.now();
-  const [mod, sceneJson] = await Promise.all([import('./features.js'), fetch('scene.json').then((r) => r.json())]);
-  scene = sceneJson;
+  const mod = await import('./features.js');
+  scene = SCENE;
   const t1 = performance.now();
   features = await mod.createEvaluator(device);
   const t2 = performance.now();
