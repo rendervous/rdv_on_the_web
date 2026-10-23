@@ -1,0 +1,408 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>rdv · HaloRT, directional light with clip plane (WebGPU)</title>
+<link rel="icon" href="data:,">
+<style>
+  :root { color-scheme: dark; }
+  body { margin: 0; background: #16181d; color: #d6d9e0; font: 13px/1.4 system-ui, sans-serif;
+         display: flex; gap: 16px; padding: 16px; box-sizing: border-box; height: 100vh; }
+  #view { position: relative; flex: 1; display: flex; align-items: center; justify-content: center;
+          background: #0d0e11; border-radius: 6px; overflow: hidden; }
+  canvas { width: min(100%, calc(100vh - 32px)); aspect-ratio: 1; cursor: grab; touch-action: none; }
+  canvas.dragging { cursor: grabbing; }
+  #stats { position: absolute; top: 10px; left: 10px; padding: 8px 10px; border-radius: 4px;
+           background: rgba(0, 0, 0, .6); font: 12px/1.5 ui-monospace, monospace; white-space: pre; pointer-events: none; }
+  aside { width: 280px; display: flex; flex-direction: column; gap: 10px; overflow-y: auto; padding-right: 4px; }
+  h1 { font-size: 15px; margin: 0; }
+  h2 { font-size: 12px; margin: 8px 0 -2px; color: #8a909b; text-transform: uppercase; letter-spacing: .05em; }
+  label { display: flex; flex-direction: column; gap: 4px; }
+  label span { display: flex; justify-content: space-between; color: #9aa0ab; }
+  label.check { flex-direction: row; align-items: center; gap: 6px; color: #c3c7cf; }
+  input[type=range], select { width: 100%; }
+  button { background: #2a2e37; color: inherit; border: 1px solid #3a3f4b; border-radius: 4px; padding: 5px 10px; cursor: pointer; }
+  .help { color: #8a909b; font-size: 12px; }
+  #error { color: #ff8a80; white-space: pre-wrap; }
+</style>
+</head>
+<body>
+<div id="view">
+  <canvas id="canvas" width="256" height="256"></canvas>
+  <div id="stats">loading…</div>
+</div>
+<aside>
+  <h1>HaloRT · directional light, clip plane</h1>
+  <div class="help">Directional light only: per frame rdv computes the VolumeDeepProfile features (one jittered
+    sample, no environment samples) and the HaloRT "dir" UNet runs once (uniform albedo, so one colour channel
+    stands for all three). Only the medium above the clip plane is considered.<br>
+    Left drag: orbit · Right / Shift drag: pan · Scroll: zoom</div>
+
+  <label><span>Resolution</span>
+    <select id="resolution"><option selected>256</option><option>512</option></select>
+  </label>
+  <label><span>Network precision</span>
+    <select id="precision">
+      <option value="fp32" selected>fp32</option>
+      <option value="fp16">fp16 (needs shader-f16; faster on some GPUs)</option>
+    </select>
+  </label>
+  <label><span>Max frames <b id="maxSppOut"></b></span>
+    <input id="maxSpp" type="range" min="1" max="256" step="1" value="64">
+  </label>
+  <label><span>Exposure <b id="exposureOut"></b></span>
+    <input id="exposure" type="range" min="-3" max="5" step="0.1" value="1">
+  </label>
+
+  <h2>Light</h2>
+  <label><span>Light intensity <b id="sunOut"></b></span>
+    <input id="sun" type="range" min="-3" max="5" step="0.1" value="1">
+  </label>
+  <label><span>Light alpha <b id="lightAOut"></b></span>
+    <input id="lightA" type="range" min="-3.14" max="3.14" step="0.01" value="-1.2">
+  </label>
+  <label><span>Light beta <b id="lightBOut"></b></span>
+    <input id="lightB" type="range" min="-1.5" max="1.5" step="0.01" value="0.5">
+  </label>
+
+  <h2>Clip plane</h2>
+  <label class="check"><input id="clip" type="checkbox" checked> clip (keep the medium above the plane)</label>
+  <label><span>Normal alpha <b id="clipAOut"></b></span>
+    <input id="clipA" type="range" min="-3.14" max="3.14" step="0.01" value="1.57">
+  </label>
+  <label><span>Normal beta <b id="clipBOut"></b></span>
+    <input id="clipB" type="range" min="-1.5" max="1.5" step="0.01" value="0">
+  </label>
+  <label><span>Distance <b id="clipDOut"></b></span>
+    <input id="clipD" type="range" min="-1.2" max="1.2" step="0.01" value="0">
+  </label>
+
+  <h2>Medium</h2>
+  <label><span>Density scale (log10) <b id="densityOut"></b></span>
+    <input id="density" type="range" min="1" max="2.7" step="0.01" value="2.30">
+  </label>
+  <label><span>g (anisotropy) <b id="gOut"></b></span>
+    <input id="g" type="range" min="0" max="0.9" step="0.01" value="0.3">
+  </label>
+  <label><span>Albedo (log10 1−a) <b id="albedoOut"></b></span>
+    <input id="albedo" type="range" min="-3" max="-0.82" step="0.01" value="-2">
+  </label>
+
+  <h2>Camera</h2>
+  <label><span>Field of view <b id="fovOut"></b></span>
+    <input id="fov" type="range" min="15" max="90" step="1" value="45">
+  </label>
+  <button id="reset">Reset camera</button>
+  <div id="error"></div>
+</aside>
+
+<script type="module">
+import * as ort from 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.30.0/dist/ort.webgpu.min.mjs';
+import { createDisplay } from '../common/display.js';
+
+const $ = (id) => document.getElementById(id);
+const stats = $('stats');
+const canvas = $('canvas');
+const num = (id) => Number($(id).value);
+const usc2dir = (a, b) => [Math.sin(a) * Math.cos(b), Math.sin(b), Math.cos(a) * Math.cos(b)];
+
+// ---------------------------------------------------------------- camera
+// Orbit camera (alpha, beta, distance) around `target`, rendered with rdv's
+// camera convention and presented with image row 0 at the bottom, so screen
+// right is cross(up, forward) and screen down the camera's down axis.
+const DEFAULT = { alpha: 0.0, beta: 0.3, distance: 2.7, target: [0, 0, 0] };
+const cam = structuredClone(DEFAULT);
+const UP = [0, 1, 0];
+const add = (a, b, s = 1) => a.map((x, i) => x + b[i] * s);
+const sub = (a, b) => a.map((x, i) => x - b[i]);
+const cross = (a, b) => [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]];
+const normalize = (a) => { const l = Math.hypot(...a); return a.map((x) => x / l); };
+const origin = () => add(cam.target, usc2dir(cam.alpha, cam.beta), cam.distance);
+function screenAxes() {
+  const forward = normalize(sub(cam.target, origin()));
+  const right = normalize(cross(UP, forward));
+  return { right, down: cross(right, forward) };
+}
+
+let restart = true;
+let retonemap = false;
+let drag = null;
+canvas.addEventListener('contextmenu', (e) => e.preventDefault());
+canvas.addEventListener('pointerdown', (e) => {
+  drag = { x: e.clientX, y: e.clientY, pan: e.button !== 0 || e.shiftKey };
+  canvas.setPointerCapture(e.pointerId);
+  canvas.classList.add('dragging');
+});
+canvas.addEventListener('pointerup', (e) => {
+  drag = null;
+  canvas.releasePointerCapture(e.pointerId);
+  canvas.classList.remove('dragging');
+});
+canvas.addEventListener('pointermove', (e) => {
+  if (!drag) return;
+  const dx = e.clientX - drag.x, dy = e.clientY - drag.y;
+  drag.x = e.clientX; drag.y = e.clientY;
+  const pixels = canvas.clientHeight;
+  if (drag.pan) {
+    const worldPerPixel = 2 * cam.distance * Math.tan(num('fov') * Math.PI / 360) / pixels;
+    const { right, down } = screenAxes();
+    cam.target = add(add(cam.target, right, -dx * worldPerPixel), down, -dy * worldPerPixel);
+  } else {
+    cam.alpha += dx / pixels * Math.PI;
+    cam.beta = Math.max(-1.5, Math.min(1.5, cam.beta + dy / pixels * Math.PI));
+  }
+  restart = true;
+});
+canvas.addEventListener('wheel', (e) => {
+  e.preventDefault();
+  cam.distance = Math.max(0.2, Math.min(20, cam.distance * Math.exp(e.deltaY * 0.001)));
+  restart = true;
+}, { passive: false });
+$('reset').onclick = () => { Object.assign(cam, structuredClone(DEFAULT)); restart = true; };
+for (const id of ['resolution', 'precision', 'sun', 'lightA', 'lightB', 'clip', 'clipA', 'clipB', 'clipD', 'density', 'g',
+                  'albedo', 'fov']) {
+  $(id).oninput = () => { restart = true; };
+}
+for (const id of ['exposure', 'maxSpp']) $(id).oninput = () => { retonemap = true; };
+
+const albedo = () => 1 - Math.pow(10, num('albedo'));
+function updateLabels() {
+  $('maxSppOut').textContent = num('maxSpp');
+  $('exposureOut').textContent = `${num('exposure') >= 0 ? '+' : ''}${num('exposure').toFixed(1)} EV`;
+  $('sunOut').textContent = `×${Math.pow(2, num('sun')).toFixed(2)}`;
+  $('lightAOut').textContent = num('lightA').toFixed(2);
+  $('lightBOut').textContent = num('lightB').toFixed(2);
+  $('densityOut').textContent = `${num('density').toFixed(2)} → ${Math.pow(10, num('density')).toFixed(0)}`;
+  $('gOut').textContent = num('g').toFixed(2);
+  $('albedoOut').textContent = `→ ${albedo().toFixed(4)}`;
+  $('clipAOut').textContent = num('clipA').toFixed(2);
+  $('clipBOut').textContent = num('clipB').toFixed(2);
+  $('clipDOut').textContent = num('clipD').toFixed(2);
+  $('fovOut').textContent = `${num('fov')}°`;
+}
+
+// ---------------------------------------------------------------- timings
+const history = [];
+const avg = (key) => history.reduce((s, h) => s + h[key], 0) / Math.max(history.length, 1);
+let loadInfo = '';
+function showStats(last) {
+  if (last) {
+    history.push(last);
+    if (history.length > 30) history.shift();
+  }
+  const h = history.at(-1);
+  if (!h) return;
+  const span = (h.end - history[0].end) / 1000;
+  const rate = history.length > 1 && span > 0 ? (history.length - 1) / span : 0;
+  const done = spp >= num('maxSpp') ? '  (done)' : '';
+  stats.textContent =
+    `${h.w}×${h.h} px   ${spp} frames${done}\n` +
+    `features (rdv)        ${h.features.toFixed(2).padStart(7)} ms  avg ${avg('features').toFixed(2)}\n` +
+    `network (HaloRT dir)  ${h.network.toFixed(2).padStart(7)} ms  avg ${avg('network').toFixed(2)}\n` +
+    `accumulate + draw     ${h.draw.toFixed(2).padStart(7)} ms  avg ${avg('draw').toFixed(2)}\n` +
+    `frame total           ${h.total.toFixed(2).padStart(7)} ms  avg ${avg('total').toFixed(2)}\n` +
+    `frames/s ${rate.toFixed(1)}\n` + loadInfo;
+}
+
+// ---------------------------------------------------------------- pipeline
+let device, features, display, scene, spp = 0;
+const sessions = {};  // size -> { session, input (GPUBuffer), inputTensor, accum (GPUBuffer) }
+let accumulatePipeline;
+
+const ACCUMULATE = /* wgsl */ `
+@group(0) @binding(0) var<storage, read> radiance : array<f32>;
+@group(0) @binding(1) var<storage, read_write> accum : array<f32>;
+@compute @workgroup_size(256) fn main(@builtin(global_invocation_id) id : vec3u) {
+  if (id.x < arrayLength(&accum)) { accum[id.x] += radiance[id.x]; }
+}`;
+
+// fp32 or fp16 HaloRT "dir" graph (fp16 is the precision HaloScatNet2 itself
+// runs at; it needs shader-f16). Every input/output is a fixed GPU buffer. Not
+// using ORT's graph capture: in onnxruntime-web 1.30 its replays kept reading
+// the first frame's features instead of the input buffer's current content.
+const precision = () => $('precision').value;
+
+async function sessionFor(size) {
+  const key = `${size}-${precision()}`;
+  if (sessions[key]) return sessions[key];
+  const t0 = performance.now();
+  stats.textContent = `loading HaloRT ${size}×${size} (${precision()})…`;
+  const session = await ort.InferenceSession.create(`halort_dir_${size}${precision() === 'fp16' ? '_fp16' : ''}.onnx`, {
+    executionProviders: [{ name: 'webgpu', device }], // our device: ORT reads the features buffer directly
+    preferredOutputLocation: 'gpu-buffer',
+  });
+  const U = GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC;
+  const buffer = (bytes) => device.createBuffer({ size: Math.max(bytes, 16), usage: U });
+  const tensor = (b, dims) => ort.Tensor.fromGpuBuffer(b, { dataType: 'float32', dims });
+  const input = buffer(14 * size * size * 4);
+  const light = buffer(12);
+  const output = buffer(3 * size * size * 4);
+  const accum = buffer(3 * size * size * 4); // COPY_SRC: lets window.halort.meanRadiance() read it back
+  sessions[key] = {
+    session, input, light, output, accum,
+    feeds: { condition: tensor(input, [1, 14, size, size]), light_intensity: tensor(light, [3]) },
+    fetches: { radiance: tensor(output, [1, 3, size, size]) },
+    accumulate: device.createBindGroup({
+      layout: accumulatePipeline.getBindGroupLayout(0),
+      entries: [{ binding: 0, resource: { buffer: output } }, { binding: 1, resource: { buffer: accum } }],
+    }),
+  };
+  loadInfo = `\nHaloRT ${size} (${precision()}): model load ${(performance.now() - t0).toFixed(0)} ms` +
+             loadInfo.replace(/\nHaloRT \d+.*$/m, '');
+  return sessions[key];
+}
+
+async function step() {
+  const t0 = performance.now();
+  const size = num('resolution');
+  const s = await sessionFor(size);
+  // A change while this frame renders sets `restart` again: this frame still
+  // gets shown (so the view follows a drag), and the next one starts over.
+  if (restart) {
+    restart = false;
+    spp = 0;
+    const encoder = device.createCommandEncoder();
+    encoder.clearBuffer(s.accum);
+    device.queue.submit([encoder.finish()]);
+  }
+  const ta = performance.now();
+  // 1) features: 14 x H x W, written by the rdv kernel into a resident heap region
+  await features.evaluate({
+    condition: { bytes: 14 * size * size * 4 },
+    origin: origin(), target: cam.target, up: UP, fov: num('fov') * Math.PI / 180, width: size, height: size,
+    'map.light_direction': usc2dir(num('lightA'), num('lightB')),
+    'map.density_scale': Math.pow(10, num('density')),
+    'map.g': num('g'),
+    'map.scattering_albedo.albedo': [albedo(), albedo(), albedo()],
+    'map.clip_direction': $('clip').checked ? usc2dir(num('clipA'), num('clipB')) : [0, 0, 0],
+    'map.clip_distance': num('clipD'),
+  }, { threads: [size, size], readback: false });
+  const t1 = performance.now();
+  // 2) network: the features region becomes the ONNX input (GPU copy, same device)
+  const region = features.region('condition');
+  let encoder = device.createCommandEncoder();
+  encoder.copyBufferToBuffer(region.buffer, region.offset, s.input, 0, 14 * size * size * 4);
+  device.queue.submit([encoder.finish()]);
+  const sun = Math.pow(2, num('sun'));
+  device.queue.writeBuffer(s.light, 0, Float32Array.from(scene.light_intensity, (x) => x * sun));
+  await s.session.run(s.feeds, s.fetches);
+  await device.queue.onSubmittedWorkDone();
+  const t2 = performance.now();
+  // 3) accumulate + draw
+  encoder = device.createCommandEncoder();
+  const pass = encoder.beginComputePass();
+  pass.setPipeline(accumulatePipeline);
+  pass.setBindGroup(0, s.accumulate);
+  pass.dispatchWorkgroups(Math.ceil(3 * size * size / 256));
+  pass.end();
+  device.queue.submit([encoder.finish()]);
+  spp++;
+  draw();
+  await device.queue.onSubmittedWorkDone();
+  const t3 = performance.now();
+  showStats({ w: size, h: size, features: t1 - ta, network: t2 - t1, draw: t3 - t2, total: t3 - t0, end: t3 });
+}
+
+function draw() {
+  const size = num('resolution');
+  const s = sessions[`${size}-${precision()}`];
+  if (!s || spp === 0) return;
+  display.draw({ buffer: s.accum, offset: 0 }, {
+    width: size, height: size, channels: 3, planar: true,
+    scale: Math.pow(2, num('exposure')) / spp, mode: 1, gamma: true,
+  });
+}
+
+let busy = false;
+function tick() {
+  updateLabels();
+  if (!busy && (restart || spp < num('maxSpp'))) {
+    busy = true;
+    step().catch((e) => { $('error').textContent = String(e?.stack ?? e); })
+          .finally(() => { busy = false; });
+  } else if (retonemap && !busy) {
+    draw();
+    showStats();
+  }
+  retonemap = false;
+  requestAnimationFrame(tick);
+}
+
+// ---------------------------------------------------------------- startup
+// ONNX Runtime Web (its emdawnwebgpu layer) reads GPUDevice.adapterInfo -
+// copied from GPUAdapter.info on devices it creates itself - and fails on
+// browsers that don't implement those (fairly new) attributes yet. Any
+// adapter/device without them reports an empty info object instead.
+function shimAdapterInfo() {
+  const fallback = { vendor: '', architecture: '', device: '', description: '', subgroupMinSize: 4, subgroupMaxSize: 128 };
+  for (const [cls, name] of [[globalThis.GPUAdapter, 'info'], [globalThis.GPUDevice, 'adapterInfo']]) {
+    if (!cls) continue;
+    const native = Object.getOwnPropertyDescriptor(cls.prototype, name);
+    Object.defineProperty(cls.prototype, name, {
+      configurable: true,
+      get() { return native?.get?.call(this) ?? fallback; },
+    });
+  }
+}
+
+try {
+  if (!navigator.gpu) throw new Error('This browser has no WebGPU (navigator.gpu is undefined).\n' +
+                                      'Use a recent Chrome/Edge, or Firefox/Safari with WebGPU enabled.');
+  shimAdapterInfo();
+  const adapter = await navigator.gpu.requestAdapter({ powerPreference: 'high-performance' });
+  if (!adapter) throw new Error('no WebGPU adapter available');
+  if (!adapter.features.has('float32-filterable')) {
+    throw new Error('this GPU/browser lacks the float32-filterable feature (needed to filter the volume texture)');
+  }
+  // one device for both rdv (features) and ONNX Runtime (network): the
+  // features never leave the GPU
+  const requiredLimits = {};
+  for (const k of ['maxStorageBufferBindingSize', 'maxBufferSize', 'maxComputeWorkgroupStorageSize',
+                   'maxComputeInvocationsPerWorkgroup', 'maxComputeWorkgroupSizeX', 'maxComputeWorkgroupSizeY',
+                   'maxComputeWorkgroupSizeZ', 'maxComputeWorkgroupsPerDimension', 'maxStorageBuffersPerShaderStage']) {
+    requiredLimits[k] = adapter.limits[k];
+  }
+  device = await adapter.requestDevice({
+    requiredFeatures: ['float32-filterable', 'shader-f16', 'timestamp-query'].filter((f) => adapter.features.has(f)),
+    requiredLimits,
+  });
+  device.lost.then((info) => { $('error').textContent = `GPU device lost: ${info.message}`; });
+  ort.env.webgpu.device = device;
+  if (!device.features.has('shader-f16')) $('precision').querySelector('[value=fp16]').disabled = true;
+  const t0 = performance.now();
+  const [mod, sceneJson] = await Promise.all([import('./features.js'), fetch('scene.json').then((r) => r.json())]);
+  scene = sceneJson;
+  const t1 = performance.now();
+  features = await mod.createEvaluator(device);
+  const t2 = performance.now();
+  display = createDisplay(device, canvas);
+  accumulatePipeline = device.createComputePipeline({
+    layout: 'auto', compute: { module: device.createShaderModule({ code: ACCUMULATE }), entryPoint: 'main' },
+  });
+  loadInfo = `\nfeatures load ${(t1 - t0).toFixed(0)} ms, pipeline+heap ${(t2 - t1).toFixed(0)} ms`;
+  await sessionFor(num('resolution'));
+  // for tests/inspection from the console: mean of the accumulated radiance
+  window.halort = window.halortDir = {
+    async meanRadiance() {
+      const s = sessions[`${num('resolution')}-${precision()}`];
+      const staging = device.createBuffer({ size: s.accum.size, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
+      const encoder = device.createCommandEncoder();
+      encoder.copyBufferToBuffer(s.accum, 0, staging, 0, s.accum.size);
+      device.queue.submit([encoder.finish()]);
+      await staging.mapAsync(GPUMapMode.READ);
+      const a = new Float32Array(staging.getMappedRange());
+      const n = a.length;
+      let sum = 0;
+      for (let i = 0; i < n; i++) sum += a[i];
+      staging.destroy(); // detaches `a`
+      return { mean: sum / n / spp, frames: spp };
+    },
+  };
+  requestAnimationFrame(tick);
+} catch (e) {
+  stats.textContent = 'failed';
+  $('error').textContent = String(e?.stack ?? e);
+}
+</script>
+</body>
+</html>

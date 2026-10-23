@@ -53,6 +53,12 @@ memory, data) ships as one self-contained JavaScript module.</p>
   sky radiance - no data leaves the GPU. Light, medium and camera controls; per-stage timings.
 </a>
 
+<a class="card" href="halort_dir/">
+  <h2>HaloRT · directional light, clip plane</h2>
+  HaloRT with a single directional light: one evaluation of the "dir" UNet per frame, no environment samples. A clip
+  plane (orientation and distance sliders) keeps only the medium above it - for the camera rays and the shadow rays.
+</a>
+
 <p id="webgpu" class="muted"></p>
 <script>
   document.getElementById('webgpu').textContent = navigator.gpu
