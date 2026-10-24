@@ -359,7 +359,7 @@ async function step() {
   const frame = beginFrame();
   // 1) features: 17 x H x W, written by the rdv kernel into a resident heap region
   await features.evaluate({
-    condition: { bytes: 17 * size * size * 4 },
+    condition: { bytes: 17 * size * size * 4, writeOnly: true }, // the kernel only writes it
     origin: origin(), target: cam.target, up: UP, fov: num('fov') * Math.PI / 180, width: size, height: size,
     'map.light_direction': usc2dir(num('lightA'), num('lightB')),
     'map.density_scale': Math.pow(10, num('density')),
